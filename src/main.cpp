@@ -16,6 +16,7 @@
 #include "UnityEngine/Object.hpp"
 #include "custom-types/shared/delegate.hpp"
 #include "UnityEngine/Texture2D.hpp"
+#include "GlobalNamespace/IDifficultyBeatmap.hpp"
 #include "GlobalNamespace/ISpriteAsyncLoader.hpp"
 #include "GlobalNamespace/StandardLevelInfoSaveData.hpp"
 #include "GlobalNamespace/StandardLevelDetailView.hpp"
@@ -60,7 +61,7 @@ extern "C" void setup(ModInfo& info) {
     getLoggerOld().info("Completed setup!");
 }
 
-static int MAX_CACHED_COVERS = 30;
+static int MAX_CACHED_COVERS = 7;
 
 
 // This is needed to avoid race conditions when clearing the cache
@@ -86,18 +87,23 @@ void ClearUnusedCovers() {
                 continue;
             }
 
-            DEBUG("Clearing cover for {}", songToInvalidate.levelId);
-            
+
+            auto coverCacheEntry = coverCache.at(songToInvalidate.levelId);
 
             if(
-                songToInvalidate.cover != nullptr &&
-                songToInvalidate.cover->m_CachedPtr.m_value != nullptr
+                coverCacheEntry != nullptr &&
+                coverCacheEntry->m_CachedPtr.m_value != nullptr
             ) {
+                DEBUG("Clearing cover for {}", songToInvalidate.levelId);
                 auto * texture = songToInvalidate.cover->get_texture();
-                Object::DestroyImmediate(songToInvalidate.cover);
                 if (texture != nullptr && texture->m_CachedPtr.m_value != nullptr) {
-                    Object::DestroyImmediate(texture);
+                    DEBUG("Destroying texture for {}", songToInvalidate.levelId);
+                    Object::Destroy(texture);
                 }
+                Object::Destroy(songToInvalidate.cover);
+                
+            } else {
+                DEBUG("Cover for {} is null", songToInvalidate.levelId);
             }
 
             coverCacheInvalidator.erase(coverCacheInvalidator.begin()+i);
@@ -114,8 +120,6 @@ MAKE_HOOK_MATCH(StandardLevelDetailView_SetContent, &StandardLevelDetailView::Se
     StandardLevelDetailView_SetContent(self, level, defaultDifficulty, defaultBeatmapCharacteristic, playerData);
     
     lastSelectedLevel = std::string(level->i_IPreviewBeatmapLevel()->get_levelID());
-    DEBUG("Selected level {}", fmt::ptr(level));
-    DEBUG("Selected level id {}", std::string( level->i_IPreviewBeatmapLevel()->get_levelID()));
 };
 
 void PrintStruct() {
@@ -125,35 +129,11 @@ void PrintStruct() {
 }
 
 MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeatmapLevel::GetCoverImageAsync, Task_1<Sprite *>*, CustomPreviewBeatmapLevel* self, System::Threading::CancellationToken cancellationToken) {
-    auto levelId = self->get_levelID();
-    DEBUG("Getting cover for {}", std::to_string(levelId));
-    // 
-    if (
-        self->coverImage != nullptr && 
-        self->coverImage->m_CachedPtr.m_value != nullptr
-        ) {
-            std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
-            int cachedIndex = -1;
-            
-            // "Refresh" the cover in the cache LIFO
-            for (auto i=0; i< coverCacheInvalidator.size(); i++) {
-                if (coverCacheInvalidator[i].levelId == std::string(self->get_levelID())) {
-                    cachedIndex = i;
-                    DEBUG("Found cached cover for {}", std::to_string(levelId));
-                    break;
-                } 
-            }
-
-            // Move to top
-            if (cachedIndex != 1 && cachedIndex + 1 != coverCacheInvalidator.size()) {
-                
-                auto item = coverCacheInvalidator[cachedIndex];
-                coverCacheInvalidator.erase(coverCacheInvalidator.begin()+cachedIndex);
-                coverCacheInvalidator.push_back(item);
-            }
-
-            return Task_1<Sprite *>::FromResult(self->coverImage);
+    if (System::String::IsNullOrEmpty(self->standardLevelInfoSaveData->coverImageFilename)) {
+        return Task_1<Sprite *>::FromResult(self->defaultCoverImage);
     }
+
+    auto levelId = self->get_levelID();
 
     // If custom cache has cover
     if (coverCache.contains(levelId)) {
@@ -179,13 +159,10 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
         return Task_1<Sprite *>::FromResult(coverCache.at(levelId));
     }
 
-    if (System::String::IsNullOrEmpty(self->standardLevelInfoSaveData->coverImageFilename)) {
-        return Task_1<Sprite *>::FromResult(self->defaultCoverImage);
-    }
+    
+    StringW path = Path::Combine(self->customLevelPath, self->standardLevelInfoSaveData->coverImageFilename);
 
-    StringW path = System::IO::Path::Combine(self->customLevelPath, self->standardLevelInfoSaveData->coverImageFilename);
-
-    if(!System::IO::File::Exists(path)) {
+    if(!File::Exists(path)) {
         DEBUG("File does not exist");
         return Task_1<Sprite *>::FromResult(self->defaultCoverImage);
     }
@@ -193,30 +170,31 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
     if (cancellationToken.get_IsCancellationRequested()) {
         return nullptr;
     }
-
-    auto beatmapMemoryAddress = &self;
     
     using Task = Task_1<UnityEngine::Sprite*>*;
     using Action = System::Func_2<Task, UnityEngine::Sprite*>*;
 
-    auto middleware = custom_types::MakeDelegate<Action>(classof(Action), static_cast<std::function<Sprite* (Task)>>([self](Task resultTask) {
+    auto middleware = custom_types::MakeDelegate<Action>(classof(Action), static_cast<std::function<Sprite* (Task)>>([levelId](Task resultTask) {
+        DEBUG("Middleware fired");
         bool cancelled = resultTask->get_IsCanceled();
         if (cancelled) {
-            DEBUG("Task cancelled, returning nullptr");
             return (Sprite*)nullptr;
         }
         UnityEngine::Sprite* cover = resultTask->get_ResultOnSuccess();
         if (cover != nullptr && cover->m_CachedPtr.m_value != nullptr) {
-            self->coverImage = cover;
-
+            
             std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
 
-            auto levelId = self->get_levelID();
             DEBUG("Level id {}", std::string(levelId));
+            
+            // Maybe
+            if (coverCache.contains(levelId)) {
+                WARNING("Cover is already in the cover cache");
+            }
 
             coverCache.emplace(levelId, cover);
             coverCacheInvalidator.push_back({
-                std::string(levelId), self->coverImage
+                std::string(levelId), cover
             });
 
             // Call clear unused covers
@@ -229,12 +207,12 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
         }
     }));
 
+    DEBUG("Running middleware");
     auto lol = MediaAsyncLoader::LoadSpriteAsync(path, cancellationToken);
-    static auto ___internal__logger = ::Logger::get().WithContext("::Task_1::ContinueWith");
-    // static auto* ___internal__method = THROW_UNLESS((::il2cpp_utils::FindMethod(lol, "ContinueWith", std::vector<Il2CppClass*>{::il2cpp_utils::il2cpp_type_check::il2cpp_gen_struct_no_arg_class<UnityEngine::Sprite*>::get()}, ::std::vector<const Il2CppType*>{::il2cpp_utils::ExtractType(middleware)})));
-    static auto* ___internal__method = ::il2cpp_utils::FindMethodUnsafe(lol, "ContinueWith", 1);
-    static auto* ___generic__method = THROW_UNLESS(::il2cpp_utils::MakeGenericMethod(___internal__method, std::vector<Il2CppClass*>{::il2cpp_utils::il2cpp_type_check::il2cpp_no_arg_class<UnityEngine::Sprite*>::get()}));
-    return ::il2cpp_utils::RunMethodRethrow<::Task_1<UnityEngine::Sprite*>*, false>(lol, ___generic__method, middleware);
+    static auto internalLogger = ::Logger::get().WithContext("::Task_1::ContinueWith");
+    static auto* method = ::il2cpp_utils::FindMethodUnsafe(lol, "ContinueWith", 1);
+    static auto* genericMethod = THROW_UNLESS(::il2cpp_utils::MakeGenericMethod(method, std::vector<Il2CppClass*>{::il2cpp_utils::il2cpp_type_check::il2cpp_no_arg_class<Sprite*>::get()}));
+    return ::il2cpp_utils::RunMethodRethrow<::Task_1<Sprite*>*, false>(lol, genericMethod, middleware);
 };
 
 
