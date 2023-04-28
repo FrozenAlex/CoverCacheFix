@@ -11,6 +11,7 @@
 #include "beatsaber-hook/shared/utils/il2cpp-functions.hpp"
 #include "beatsaber-hook/shared/utils/hooking.hpp"
 #include <vector>
+#include <string>
 #include "UnityEngine/Sprite.hpp"
 #include "GlobalNamespace/IBeatmapLevel.hpp"
 
@@ -18,12 +19,14 @@ using namespace GlobalNamespace;
 
 // State
 struct SongCacheEntry {
-    GlobalNamespace::IBeatmapLevel* level;
+    std::string levelId;
     UnityEngine::Sprite* cover;
 };
+
+static std::unordered_map<std::string, UnityEngine::Sprite*> coverCache;
 static std::vector<SongCacheEntry> coverCacheInvalidator;
 static std::mutex coverCacheInvalidatorMutex;
-static GlobalNamespace::IBeatmapLevel*  lastSelectedLevel = nullptr;
+static std::string lastSelectedLevel = "";
 
 
 // Define these functions here so that we can easily read configuration and log information from other files

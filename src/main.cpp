@@ -60,12 +60,12 @@ extern "C" void setup(ModInfo& info) {
     getLoggerOld().info("Completed setup!");
 }
 
-static int MAX_CACHED_COVERS = 3;
+static int MAX_CACHED_COVERS = 30;
 
 
 // This is needed to avoid race conditions when clearing the cache
 void ClearUnusedCovers() {
-    static bool isRunning = false;
+    static std::atomic<bool> isRunning = false;
 
     if (isRunning) {
         return;
@@ -80,19 +80,28 @@ void ClearUnusedCovers() {
             auto songToInvalidate = coverCacheInvalidator[i];
             
             // Skip selected level
-            if(lastSelectedLevel == songToInvalidate.level) {
+            DEBUG("Comparing {} to {}", lastSelectedLevel, songToInvalidate.levelId);
+            if(lastSelectedLevel == songToInvalidate.levelId) {
+                DEBUG("Skipping selected level {}", lastSelectedLevel);
                 continue;
             }
 
-            coverCacheInvalidator.erase(coverCacheInvalidator.begin()+i);
+            DEBUG("Clearing cover for {}", songToInvalidate.levelId);
             
-            if(songToInvalidate.cover != nullptr && songToInvalidate.cover->m_CachedPtr.m_value != nullptr) {
+
+            if(
+                songToInvalidate.cover != nullptr &&
+                songToInvalidate.cover->m_CachedPtr.m_value != nullptr
+            ) {
                 auto * texture = songToInvalidate.cover->get_texture();
                 Object::DestroyImmediate(songToInvalidate.cover);
                 if (texture != nullptr && texture->m_CachedPtr.m_value != nullptr) {
                     Object::DestroyImmediate(texture);
                 }
             }
+
+            coverCacheInvalidator.erase(coverCacheInvalidator.begin()+i);
+            coverCache.erase(songToInvalidate.levelId);
         }     
         isRunning = false;
     });
@@ -103,27 +112,34 @@ MAKE_HOOK_MATCH(StandardLevelDetailView_SetContent, &StandardLevelDetailView::Se
     // Prefix
     // fix
     StandardLevelDetailView_SetContent(self, level, defaultDifficulty, defaultBeatmapCharacteristic, playerData);
-    // postfix
-    lastSelectedLevel = level;
+    
+    lastSelectedLevel = std::string(level->i_IPreviewBeatmapLevel()->get_levelID());
+    DEBUG("Selected level {}", fmt::ptr(level));
+    DEBUG("Selected level id {}", std::string( level->i_IPreviewBeatmapLevel()->get_levelID()));
 };
 
-MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeatmapLevel::GetCoverImageAsync, Task_1<Sprite *>*, CustomPreviewBeatmapLevel* self, System::Threading::CancellationToken cancellationToken) {
+void PrintStruct() {
+
     
 
+}
+
+MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeatmapLevel::GetCoverImageAsync, Task_1<Sprite *>*, CustomPreviewBeatmapLevel* self, System::Threading::CancellationToken cancellationToken) {
+    auto levelId = self->get_levelID();
+    DEBUG("Getting cover for {}", std::to_string(levelId));
     // 
     if (
         self->coverImage != nullptr && 
-        self->coverImage->m_CachedPtr.m_value != nullptr &&
-        self->coverImage->get_texture() != nullptr &&
-        self->coverImage->get_texture()->m_CachedPtr.m_value != nullptr
+        self->coverImage->m_CachedPtr.m_value != nullptr
         ) {
             std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
             int cachedIndex = -1;
+            
             // "Refresh" the cover in the cache LIFO
-            for (auto i=0; i< coverCacheInvalidator.size(); i--) {
-                auto level = reinterpret_cast<CustomPreviewBeatmapLevel*>(coverCacheInvalidator[i].level);
-                if (level == self) {
+            for (auto i=0; i< coverCacheInvalidator.size(); i++) {
+                if (coverCacheInvalidator[i].levelId == std::string(self->get_levelID())) {
                     cachedIndex = i;
+                    DEBUG("Found cached cover for {}", std::to_string(levelId));
                     break;
                 } 
             }
@@ -137,6 +153,30 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
             }
 
             return Task_1<Sprite *>::FromResult(self->coverImage);
+    }
+
+    // If custom cache has cover
+    if (coverCache.contains(levelId)) {
+        std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
+        int cachedIndex = -1;
+            
+        // "Refresh" the cover in the cache LIFO
+        for (auto i=0; i< coverCacheInvalidator.size(); i++) {
+            if (coverCacheInvalidator[i].levelId == std::string(levelId)) {
+                cachedIndex = i;
+                break;
+            }
+        }
+
+        // Move to top
+        if (cachedIndex != 1 && cachedIndex + 1 != coverCacheInvalidator.size()) {
+            auto item = coverCacheInvalidator[cachedIndex];
+            coverCacheInvalidator.erase(coverCacheInvalidator.begin()+cachedIndex);
+            coverCacheInvalidator.push_back(item);
+        }
+
+        DEBUG("Custom cache fired");
+        return Task_1<Sprite *>::FromResult(coverCache.at(levelId));
     }
 
     if (System::String::IsNullOrEmpty(self->standardLevelInfoSaveData->coverImageFilename)) {
@@ -153,6 +193,8 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
     if (cancellationToken.get_IsCancellationRequested()) {
         return nullptr;
     }
+
+    auto beatmapMemoryAddress = &self;
     
     using Task = Task_1<UnityEngine::Sprite*>*;
     using Action = System::Func_2<Task, UnityEngine::Sprite*>*;
@@ -166,9 +208,15 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
         UnityEngine::Sprite* cover = resultTask->get_ResultOnSuccess();
         if (cover != nullptr && cover->m_CachedPtr.m_value != nullptr) {
             self->coverImage = cover;
+
             std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
+
+            auto levelId = self->get_levelID();
+            DEBUG("Level id {}", std::string(levelId));
+
+            coverCache.emplace(levelId, cover);
             coverCacheInvalidator.push_back({
-                reinterpret_cast<GlobalNamespace::IBeatmapLevel*>(self), self->coverImage
+                std::string(levelId), self->coverImage
             });
 
             // Call clear unused covers
