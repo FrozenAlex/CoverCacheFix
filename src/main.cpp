@@ -5,6 +5,7 @@
 #include "System/Threading/Tasks/TaskCanceledException.hpp"
 #include "GlobalNamespace/IBeatmapLevelPack.hpp"
 #include "GlobalNamespace/IBeatmapLevel.hpp"
+#include "GlobalNamespace/IBeatmapLevelData.hpp"
 #include "System/Action.hpp"
 #include "System/Func_1.hpp"
 #include "System/Func_2.hpp"
@@ -74,7 +75,12 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
     static int MAX_CACHED_COVERS = 3;
 
     // 
-    if (self->coverImage != nullptr && self->coverImage->m_CachedPtr.m_value != nullptr) {
+    if (
+        self->coverImage != nullptr && 
+        self->coverImage->m_CachedPtr.m_value != nullptr &&
+        self->coverImage->get_texture() != nullptr &&
+        self->coverImage->get_texture()->m_CachedPtr.m_value != nullptr
+        ) {
         int cachedIndex = -1;
         // "Refresh" the cover in the cache LIFO
         for (auto i=0; i< coverCacheInvalidator.size(); i--) {
@@ -85,10 +91,14 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
             } 
         }
 
+        DEBUG("Cached index: {}", std::to_string(cachedIndex));
+        DEBUG("Cover cache invalidator size {} ",std::to_string(coverCacheInvalidator.size()));
+        DEBUG("Cached for song {}", std::to_string(self->songName));
         // Move to top
         if (cachedIndex != 1 && cachedIndex + 1 != coverCacheInvalidator.size()) {
-            coverCacheInvalidator.push_back(coverCacheInvalidator[cachedIndex]);
+            auto item = coverCacheInvalidator[cachedIndex];
             coverCacheInvalidator.erase(coverCacheInvalidator.begin()+cachedIndex);
+            coverCacheInvalidator.push_back(item);
         }
 
         DEBUG("Cached image");
@@ -132,12 +142,22 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
             QuestUI::MainThreadScheduler::Schedule([]{
                 DEBUG("Remove cover from cache run");
                 for(int i = coverCacheInvalidator.size() - MAX_CACHED_COVERS; i-- > 0;) {
-
+                    DEBUG("Remove cover from cache run {}", i);
+                    DEBUG("Remove cover from cache run {}", coverCacheInvalidator.size());
                 auto songToInvalidate = coverCacheInvalidator[i];
+
+              
                 
                 // Skip selected level
-                if(lastSelectedLevel == songToInvalidate.level)
-            		continue;
+                if(lastSelectedLevel == songToInvalidate.level) {
+                    auto song = reinterpret_cast<CustomPreviewBeatmapLevel*>(songToInvalidate.level);
+                    DEBUG("Selected song, skipping {}", std::to_string(song->songName));
+                    continue;
+                }
+                   
+                auto song = reinterpret_cast<CustomPreviewBeatmapLevel*>(songToInvalidate.level);
+                DEBUG("Removing song cover from cache {}", std::to_string(song->songName));
+              
 
                 coverCacheInvalidator.erase(coverCacheInvalidator.begin()+i);
                 
