@@ -9,7 +9,8 @@
 			"stack": ["pwsh ./scripts/ndk-stack.ps1"],
 			"tomb": ["pwsh ./scripts/pull-tombstone.ps1"],
 			"restart": ["pwsh ./scripts/restart-game.ps1"],
-			"logcat": ["pwsh ./scripts/start-logging.ps1"]
+			"logcat": ["pwsh ./scripts/start-logging.ps1"],
+			"logs": ["pwsh ./scripts/logs.ps1"]
 		}
 	},
 	"info": {
