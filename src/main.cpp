@@ -60,7 +60,43 @@ extern "C" void setup(ModInfo& info) {
     getLoggerOld().info("Completed setup!");
 }
 
+static int MAX_CACHED_COVERS = 3;
 
+
+// This is needed to avoid race conditions when clearing the cache
+void ClearUnusedCovers() {
+    static bool isRunning = false;
+
+    if (isRunning) {
+        return;
+    }
+
+    QuestUI::MainThreadScheduler::Schedule([]{
+        // Extra check just in case
+        if (isRunning) return;
+        std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
+        isRunning = true;
+        for(int i = coverCacheInvalidator.size() - MAX_CACHED_COVERS; i-- > 0;) {
+            auto songToInvalidate = coverCacheInvalidator[i];
+            
+            // Skip selected level
+            if(lastSelectedLevel == songToInvalidate.level) {
+                continue;
+            }
+
+            coverCacheInvalidator.erase(coverCacheInvalidator.begin()+i);
+            
+            if(songToInvalidate.cover != nullptr && songToInvalidate.cover->m_CachedPtr.m_value != nullptr) {
+                auto * texture = songToInvalidate.cover->get_texture();
+                Object::DestroyImmediate(songToInvalidate.cover);
+                if (texture != nullptr && texture->m_CachedPtr.m_value != nullptr) {
+                    Object::DestroyImmediate(texture);
+                }
+            }
+        }     
+        isRunning = false;
+    });
+}
 
 
 MAKE_HOOK_MATCH(StandardLevelDetailView_SetContent, &StandardLevelDetailView::SetContent, void, StandardLevelDetailView* self, IBeatmapLevel* level, BeatmapDifficulty defaultDifficulty, BeatmapCharacteristicSO* defaultBeatmapCharacteristic, PlayerData* playerData) {
@@ -72,7 +108,7 @@ MAKE_HOOK_MATCH(StandardLevelDetailView_SetContent, &StandardLevelDetailView::Se
 };
 
 MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeatmapLevel::GetCoverImageAsync, Task_1<Sprite *>*, CustomPreviewBeatmapLevel* self, System::Threading::CancellationToken cancellationToken) {
-    static int MAX_CACHED_COVERS = 3;
+    
 
     // 
     if (
@@ -81,32 +117,29 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
         self->coverImage->get_texture() != nullptr &&
         self->coverImage->get_texture()->m_CachedPtr.m_value != nullptr
         ) {
-        int cachedIndex = -1;
-        // "Refresh" the cover in the cache LIFO
-        for (auto i=0; i< coverCacheInvalidator.size(); i--) {
-            auto level = reinterpret_cast<CustomPreviewBeatmapLevel*>(coverCacheInvalidator[i].level);
-            if (level == self) {
-                cachedIndex = i;
-                break;
-            } 
-        }
+            std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
+            int cachedIndex = -1;
+            // "Refresh" the cover in the cache LIFO
+            for (auto i=0; i< coverCacheInvalidator.size(); i--) {
+                auto level = reinterpret_cast<CustomPreviewBeatmapLevel*>(coverCacheInvalidator[i].level);
+                if (level == self) {
+                    cachedIndex = i;
+                    break;
+                } 
+            }
 
-        DEBUG("Cached index: {}", std::to_string(cachedIndex));
-        DEBUG("Cover cache invalidator size {} ",std::to_string(coverCacheInvalidator.size()));
-        DEBUG("Cached for song {}", std::to_string(self->songName));
-        // Move to top
-        if (cachedIndex != 1 && cachedIndex + 1 != coverCacheInvalidator.size()) {
-            auto item = coverCacheInvalidator[cachedIndex];
-            coverCacheInvalidator.erase(coverCacheInvalidator.begin()+cachedIndex);
-            coverCacheInvalidator.push_back(item);
-        }
+            // Move to top
+            if (cachedIndex != 1 && cachedIndex + 1 != coverCacheInvalidator.size()) {
+                
+                auto item = coverCacheInvalidator[cachedIndex];
+                coverCacheInvalidator.erase(coverCacheInvalidator.begin()+cachedIndex);
+                coverCacheInvalidator.push_back(item);
+            }
 
-        DEBUG("Cached image");
-        return Task_1<Sprite *>::FromResult(self->coverImage);
+            return Task_1<Sprite *>::FromResult(self->coverImage);
     }
 
     if (System::String::IsNullOrEmpty(self->standardLevelInfoSaveData->coverImageFilename)) {
-        DEBUG("Default image");
         return Task_1<Sprite *>::FromResult(self->defaultCoverImage);
     }
 
@@ -132,49 +165,14 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
         }
         UnityEngine::Sprite* cover = resultTask->get_ResultOnSuccess();
         if (cover != nullptr && cover->m_CachedPtr.m_value != nullptr) {
-            DEBUG("Cover not null");
             self->coverImage = cover;
+            std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
             coverCacheInvalidator.push_back({
                 reinterpret_cast<GlobalNamespace::IBeatmapLevel*>(self), self->coverImage
             });
 
-            DEBUG("Remove cover from cache rergister");
-            QuestUI::MainThreadScheduler::Schedule([]{
-                DEBUG("Remove cover from cache run");
-                for(int i = coverCacheInvalidator.size() - MAX_CACHED_COVERS; i-- > 0;) {
-                    DEBUG("Remove cover from cache run {}", i);
-                    DEBUG("Remove cover from cache run {}", coverCacheInvalidator.size());
-                auto songToInvalidate = coverCacheInvalidator[i];
-
-              
-                
-                // Skip selected level
-                if(lastSelectedLevel == songToInvalidate.level) {
-                    auto song = reinterpret_cast<CustomPreviewBeatmapLevel*>(songToInvalidate.level);
-                    DEBUG("Selected song, skipping {}", std::to_string(song->songName));
-                    continue;
-                }
-                   
-                auto song = reinterpret_cast<CustomPreviewBeatmapLevel*>(songToInvalidate.level);
-                DEBUG("Removing song cover from cache {}", std::to_string(song->songName));
-              
-
-                coverCacheInvalidator.erase(coverCacheInvalidator.begin()+i);
-                
-                if(songToInvalidate.level != nullptr && songToInvalidate.cover != nullptr && songToInvalidate.cover->m_CachedPtr.m_value != nullptr) {
-                    auto song = reinterpret_cast<CustomPreviewBeatmapLevel*>(songToInvalidate.level);
-                    
-                    song->coverImage = nullptr;
-                    if (songToInvalidate.cover != nullptr && songToInvalidate.cover->m_CachedPtr.m_value != nullptr) {
-                        auto * texture = songToInvalidate.cover->get_texture();
-                        Object::DestroyImmediate(songToInvalidate.cover);
-                        if (texture != nullptr && texture->m_CachedPtr.m_value != nullptr) {
-                            Object::DestroyImmediate(texture);
-                        }
-                    }
-                }
-            }     
-            });
+            // Call clear unused covers
+            ClearUnusedCovers();
 
             return cover;
         } else {

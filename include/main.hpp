@@ -22,6 +22,7 @@ struct SongCacheEntry {
     UnityEngine::Sprite* cover;
 };
 static std::vector<SongCacheEntry> coverCacheInvalidator;
+static std::mutex coverCacheInvalidatorMutex;
 static GlobalNamespace::IBeatmapLevel*  lastSelectedLevel = nullptr;
 
 
