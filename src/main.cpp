@@ -34,6 +34,7 @@ inline modloader::ModInfo modInfo = {MOD_ID, VERSION, 0}; // Stores the ID and v
 
 #define coro(coroutine) BSML::SharedCoroutineStarter::get_instance()->StartCoroutine(custom_types::Helpers::CoroutineHelper::New(coroutine))
 
+
 // Loads the config from disk using our modInfo, then returns it for use
 // other config tools such as config-utils don't use this config, so it can be removed if those are in use
 Configuration& getConfig() {
@@ -64,7 +65,97 @@ extern "C" __attribute__((visibility("default"))) void setup(CModInfo& info) {
     getLoggerOld().info("Completed setup!");
 }
 
-static int MAX_CACHED_COVERS = 3;
+//// TASK UTILS
+template<typename Ret, typename T>
+requires(std::is_invocable_r_v<Ret, T>)
+void task_func(System::Threading::Tasks::Task_1<Ret>* task, T func) {
+    task->TrySetResult(std::invoke(func));
+}
+
+template<typename Ret, typename T>
+requires(std::is_invocable_r_v<Ret, T>)
+void task_cancel_func(System::Threading::Tasks::Task_1<Ret>* task, T func, System::Threading::CancellationToken cancelToken) {
+    auto value = std::invoke(func);
+    if (!cancelToken.IsCancellationRequested) {
+        task->TrySetResult(func);
+    } else {
+        task->TrySetCanceled(cancelToken);
+    }
+}
+
+template<typename Ret, typename T>
+requires(!std::is_same_v<Ret, void> && std::is_invocable_r_v<Ret, T>)
+System::Threading::Tasks::Task_1<Ret>* StartTask(T func) {
+    auto t = System::Threading::Tasks::Task_1<Ret>::New_ctor();
+    il2cpp_utils::il2cpp_aware_thread(&task_func<Ret, T>, t, func).detach();
+    return t;
+}
+
+template<typename Ret, typename T>
+requires(!std::is_same_v<Ret, void> && std::is_invocable_r_v<Ret, T>)
+System::Threading::Tasks::Task_1<Ret>* StartTask(T func, System::Threading::CancellationToken cancelToken) {
+    auto t = System::Threading::Tasks::Task_1<Ret>::New_ctor();
+    il2cpp_utils::il2cpp_aware_thread(&task_cancel_func<Ret, T>, t, func, cancelToken).detach();
+    return t;
+}
+
+//// TASK UTILS
+
+
+static int MAX_CACHED_COVERS = 50;
+
+
+/**
+ * @brief Remove a cover from the cache by levelId (does not destroy the cover image)
+ * 
+ * @param levelId 
+ * @return true 
+ * @return false 
+ */
+bool RemoveCoverFromCache(std::string levelId) {
+    int cachedIndex = -1;
+    // "Refresh" the cover in the cache LIFO
+    for (auto i = 0; i < coverCacheInvalidator.size(); i++) {
+        if (coverCacheInvalidator[i].levelId == std::string(levelId)) {
+            cachedIndex = i;
+            break;
+        }
+    }
+
+    if (cachedIndex == -1) return false;
+ 
+
+    // Remove from invalidator
+    if (cachedIndex != -1 && cachedIndex + 1 != coverCacheInvalidator.size()) {
+        auto item = coverCacheInvalidator[cachedIndex];
+        coverCacheInvalidator.erase(coverCacheInvalidator.begin()+cachedIndex);
+    }
+    coverCache.erase(levelId);
+
+    return true;
+    
+}
+
+bool RefreshCoverCache(std::string levelId) {
+    int cachedIndex = -1;
+
+    // "Refresh" the cover in the cache LIFO
+    for (auto i = 0; i < coverCacheInvalidator.size(); i++) {
+        if (coverCacheInvalidator[i].levelId == std::string(levelId)) {
+            cachedIndex = i;
+            break;
+        }
+    }
+
+    // Move to top
+    if (cachedIndex != -1 && cachedIndex + 1 != coverCacheInvalidator.size()) {
+        auto item = coverCacheInvalidator[cachedIndex];
+        coverCacheInvalidator.erase(coverCacheInvalidator.begin()+cachedIndex);
+        coverCacheInvalidator.push_back(item);
+        return true;
+    }
+    return false;
+}
 
 // This is needed to avoid race conditions when clearing the cache
 void ClearUnusedCovers() {
@@ -103,9 +194,9 @@ void ClearUnusedCovers() {
 
             if(coverCacheEntry) {
                 auto texture = coverCacheEntry->get_texture();
-                Object::DestroyImmediate(coverCacheEntry);
+                Object::Destroy(coverCacheEntry);
                 if (texture) {
-                    Object::DestroyImmediate(texture);
+                    Object::Destroy(texture);
                 }
                 
             } else {
@@ -132,36 +223,31 @@ MAKE_HOOK_MATCH(StandardLevelDetailView_SetContent, &StandardLevelDetailView::Se
 
 MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeatmapLevel::GetCoverImageAsync, Task_1<UnityW<Sprite>>*, CustomPreviewBeatmapLevel* self, System::Threading::CancellationToken cancellationToken) {
     try {
-        DEBUG("GetCoverImageAsync hook called");
+        // DEBUG("GetCoverImageAsync hook called");
     if (System::String::IsNullOrEmpty(self->get_standardLevelInfoSaveData()->get_coverImageFilename())) {
         return Task_1<UnityW<Sprite>>::FromResult(self->get_defaultCoverImage());
     }
 
     auto levelId = self->get_levelID();
 
-    DEBUG("Level ID: {}", to_utf8(csstrtostr(levelId)).c_str());
-    // If custom cache has cover
-    if (coverCache.contains(levelId)) {
+    // DEBUG("Level ID: {}", to_utf8(csstrtostr(levelId)).c_str());
+
+    {
         std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
-        int cachedIndex = -1;
-            
-        // "Refresh" the cover in the cache LIFO
-        for (auto i = 0; i < coverCacheInvalidator.size(); i++) {
-            if (coverCacheInvalidator[i].levelId == std::string(levelId)) {
-                cachedIndex = i;
-                break;
+        // If custom cache has cover that is not null, return it
+        if (coverCache.contains(levelId)) {
+            // If the cover is already in the cache, return it and remove the old entry
+            if (coverCache.at(levelId)) {
+                RefreshCoverCache(levelId);
+
+                return Task_1<UnityW<Sprite>>::FromResult(coverCache.at(levelId));
+            } else {
+                // If the cover is null, remove it from the cache
+                RemoveCoverFromCache(levelId);
             }
         }
-
-        // Move to top
-        if (cachedIndex != 1 && cachedIndex + 1 != coverCacheInvalidator.size()) {
-            auto item = coverCacheInvalidator[cachedIndex];
-            coverCacheInvalidator.erase(coverCacheInvalidator.begin()+cachedIndex);
-            coverCacheInvalidator.push_back(item);
-        }
-
-        return Task_1<UnityW<Sprite>>::FromResult(coverCache.at(levelId));
     }
+    
 
     
     StringW path = Path::Combine(self->get_customLevelPath(), self->get_standardLevelInfoSaveData()->get_coverImageFilename());
@@ -175,77 +261,68 @@ MAKE_HOOK_MATCH(CustomPreviewBeatmapLevel_GetCoverImageAsync, &CustomPreviewBeat
         return nullptr;
     }
     
-    using Task = Task_1<UnityEngine::Sprite*>*;
-    using Action = System::Func_2<Task, UnityEngine::Sprite*>*;
-
-    auto middleware = custom_types::MakeDelegate<Action>(classof(Action), static_cast<std::function<UnityW<Sprite> (Task)>>([levelId](Task resultTask) {
-        UnityW<UnityEngine::Sprite> cover = resultTask->get_ResultOnSuccess();
-        try {
-            if (cover != nullptr && cover->___m_CachedPtr != nullptr) {
-            {
-                std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
-
-                // If the cover is already in the cache, return it and remove the old entry
-                if (coverCache.contains(levelId)) {
-                    // Find the old entry and revalidate it
-                    int cachedIndex = -1;
-                        
-                    // "Refresh" the cover in the cache LIFO
-                    for (auto i = 0; i < coverCacheInvalidator.size(); i++) {
-                        if (coverCacheInvalidator[i].levelId == std::string(levelId)) {
-                            cachedIndex = i;
-                            break;
-                        }
-                    }
-
-                    // Move to top
-                    if (cachedIndex != 1 && cachedIndex + 1 != coverCacheInvalidator.size()) {
-                        auto item = coverCacheInvalidator[cachedIndex];
-                        coverCacheInvalidator.erase(coverCacheInvalidator.begin()+cachedIndex);
-                        coverCacheInvalidator.push_back(item);
-                    }
-
-                    WARNING("Cover is already in the cover cache");
-
-
-                    BSML::MainThreadScheduler::Schedule([cover]{
-                        UnityEngine::Object::DestroyImmediate(cover);
-                    });
-                    
-
-                    // Get the cached entry and return
-                    auto coverCacheEntry = coverCache.at(levelId);
-                    return coverCacheEntry;
-                     
-                }
-
-                coverCache.emplace(levelId, cover);
-
-                coverCacheInvalidator.push_back({
-                    std::string(levelId), cover
-                });
-            }
-            
-            // Call clear unused covers
-            ClearUnusedCovers();
-            
-            return cover;
-        } else {
-            return (UnityW<Sprite>)nullptr;
-        }
-        } catch (...) {
-            getLoggerOld().error("An error occurred in GetCoverImageAsync middleware");
-            return (UnityW<Sprite>)nullptr;
-        }
-        
-    }));
+  
 
     // WARNING if you don't use get_None() it will leak memory every time it gets cancelled
-    auto lol = MediaAsyncLoader::LoadSpriteAsync(path, CancellationToken::get_None());
-    static auto internalLogger = ::Logger::get().WithContext("::Task_1::ContinueWith");
-    static auto* method = ::il2cpp_utils::FindMethodUnsafe(lol, "ContinueWith", 1);
-    static auto* genericMethod = THROW_UNLESS(::il2cpp_utils::MakeGenericMethod(method, std::vector<Il2CppClass*>{::il2cpp_utils::il2cpp_type_check::il2cpp_no_arg_class<Sprite*>::get()}));
-    return ::il2cpp_utils::RunMethodRethrow<::Task_1<UnityW<Sprite>>*, false>(lol, genericMethod, middleware);
+    // auto lol = MediaAsyncLoader::LoadSpriteAsync(path, CancellationToken::get_None());
+    // static auto internalLogger = ::Logger::get().WithContext("::Task_1::ContinueWith");
+    // static auto* method = ::il2cpp_utils::FindMethodUnsafe(lol, "ContinueWith", 1);
+    // static auto* genericMethod = THROW_UNLESS(::il2cpp_utils::MakeGenericMethod(method, std::vector<Il2CppClass*>{::il2cpp_utils::il2cpp_type_check::il2cpp_no_arg_class<Sprite*>::get()}));
+    // return ::il2cpp_utils::RunMethodRethrow<::Task_1<UnityW<Sprite>>*, false>(lol, genericMethod, middleware);
+        Task_1<UnityW<UnityEngine::Sprite>>* loadSpriteTask = MediaAsyncLoader::LoadSpriteAsync(path, CancellationToken::get_None());
+
+        return StartTask<UnityW<Sprite>>([=]{
+            // Wait for the task to complete
+            loadSpriteTask->Wait();
+
+            if (loadSpriteTask->get_IsCompleted()) {
+                auto cover = loadSpriteTask->get_ResultOnSuccess();
+
+                if (cover) {
+                    
+                    std::lock_guard<std::mutex> lock(coverCacheInvalidatorMutex);
+
+                    // If the cover is already in the cache, return it and remove the old entry
+                    if (coverCache.contains(levelId) && coverCache.at(levelId)) {
+
+                        RefreshCoverCache(levelId);
+                        
+                        WARNING("Cover is already in the cover cache");
+                        
+                        // Destroy the new cover
+                        BSML::MainThreadScheduler::Schedule([cover]{
+                            UnityEngine::Object::Destroy(cover);
+                        });
+                        
+                        // Get the cached entry and return
+                        auto coverCacheEntry = coverCache.at(levelId);
+                        
+                        return coverCacheEntry;
+                    } else {
+                        // Add to cache
+                        coverCache.emplace(levelId, cover);
+
+                        coverCacheInvalidator.push_back({
+                            std::string(levelId), cover
+                        });
+
+                        // Call clear unused covers
+                        ClearUnusedCovers();
+
+                        return cover;
+                    }
+                     
+                } else {
+                    return self->get_defaultCoverImage();
+                }
+
+
+            } else {
+                DEBUG("Task is not completed");
+                return self->get_defaultCoverImage();
+            }
+        }, CancellationToken::get_None());
+
     } catch(...) {
         getLoggerOld().error("An error occurred in GetCoverImageAsync");
         return Task_1<UnityW<Sprite>>::FromResult(self->get_defaultCoverImage());
