@@ -1,7 +1,7 @@
 #pragma once
 
 // Include the modloader header, which allows us to tell the modloader which mod this is, and the version etc.
-#include "modloader/shared/modloader.hpp"
+#include "scotland2/shared/loader.hpp"
 #include <fmt/core.h>
 #include "paper/shared/logger.hpp"
 // beatsaber-hook is a modding framework that lets us call functions and fetch field values from in the game
@@ -20,10 +20,10 @@ using namespace GlobalNamespace;
 // State
 struct SongCacheEntry {
     std::string levelId;
-    UnityEngine::Sprite* cover;
+    UnityW<UnityEngine::Sprite> cover;
 };
 
-static std::unordered_map<std::string, UnityEngine::Sprite*> coverCache;
+static std::unordered_map<std::string, UnityW<UnityEngine::Sprite>> coverCache;
 static std::vector<SongCacheEntry> coverCacheInvalidator;
 static std::mutex coverCacheInvalidatorMutex;
 static std::string lastSelectedLevel = "";
